@@ -20,183 +20,10 @@ from ..utils import (
     url_or_none,
 )
 
+import sys
 
 class NRKBaseIE(InfoExtractor):
     _GEO_COUNTRIES = ['NO']
-
-    _api_host = None
-
-    def _real_extract(self, url):
-        video_id = self._match_id(url)
-
-        api_hosts = (self._api_host, ) if self._api_host else self._API_HOSTS
-
-        for api_host in api_hosts:
-            data = self._download_json(
-                'http://%s/mediaelement/%s' % (api_host, video_id),
-                video_id, 'Downloading mediaelement JSON',
-                fatal=api_host == api_hosts[-1])
-            if not data:
-                continue
-            self._api_host = api_host
-            break
-
-        title = data.get('fullTitle') or data.get('mainTitle') or data['title']
-        video_id = data.get('id') or video_id
-
-        entries = []
-
-        conviva = data.get('convivaStatistics') or {}
-        live = (data.get('mediaElementType') == 'Live'
-                or data.get('isLive') is True or conviva.get('isLive'))
-
-        def make_title(t):
-            return self._live_title(t) if live else t
-
-        media_assets = data.get('mediaAssets')
-        if media_assets and isinstance(media_assets, list):
-            def video_id_and_title(idx):
-                return ((video_id, title) if len(media_assets) == 1
-                        else ('%s-%d' % (video_id, idx), '%s (Part %d)' % (title, idx)))
-            for num, asset in enumerate(media_assets, 1):
-                asset_url = asset.get('url')
-                if not asset_url:
-                    continue
-                formats = self._extract_akamai_formats(asset_url, video_id)
-                if not formats:
-                    continue
-                self._sort_formats(formats)
-
-                # Some f4m streams may not work with hdcore in fragments' URLs
-                for f in formats:
-                    extra_param = f.get('extra_param_to_segment_url')
-                    if extra_param and 'hdcore' in extra_param:
-                        del f['extra_param_to_segment_url']
-
-                entry_id, entry_title = video_id_and_title(num)
-                duration = parse_duration(asset.get('duration'))
-                subtitles = {}
-                subtitle_base = asset.get('timedTextSubtitlesUrl')
-                for subtitle in ('ttml', 'vtt'):
-                    subtitle_url = re.sub(r"ttml$", subtitle, subtitle_base)
-                    if subtitle_url:
-                        subtitles.setdefault('no', []).append({
-                            'url': compat_urllib_parse_unquote(subtitle_url)
-                        })
-                entries.append({
-                    'id': asset.get('carrierId') or entry_id,
-                    'title': make_title(entry_title),
-                    'duration': duration,
-                    'subtitles': subtitles,
-                    'formats': formats,
-                })
-
-        if not entries:
-            media_url = data.get('mediaUrl')
-            if media_url:
-                formats = self._extract_akamai_formats(media_url, video_id)
-                self._sort_formats(formats)
-                duration = parse_duration(data.get('duration'))
-                entries = [{
-                    'id': video_id,
-                    'title': make_title(title),
-                    'duration': duration,
-                    'formats': formats,
-                }]
-
-        if not entries:
-            MESSAGES = {
-                'ProgramRightsAreNotReady': 'Du kan dessverre ikke se eller høre programmet',
-                'ProgramRightsHasExpired': 'Programmet har gått ut',
-                'NoProgramRights': 'Ikke tilgjengelig',
-                'ProgramIsGeoBlocked': 'NRK har ikke rettigheter til å vise dette programmet utenfor Norge',
-            }
-            message_type = data.get('messageType', '')
-            # Can be ProgramIsGeoBlocked or ChannelIsGeoBlocked*
-            if 'IsGeoBlocked' in message_type:
-                self.raise_geo_restricted(
-                    msg=MESSAGES.get('ProgramIsGeoBlocked'),
-                    countries=self._GEO_COUNTRIES)
-            raise ExtractorError(
-                '%s said: %s' % (self.IE_NAME, MESSAGES.get(
-                    message_type, message_type)),
-                expected=True)
-
-        series = conviva.get('seriesName') or data.get('seriesTitle')
-        episode = conviva.get('episodeName') or data.get('episodeNumberOrDate')
-
-        season_number = None
-        episode_number = None
-        if data.get('mediaElementType') == 'Episode':
-            _season_episode = data.get('scoresStatistics', {}).get('springStreamStream') or \
-                data.get('relativeOriginUrl', '')
-            EPISODENUM_RE = [
-                r'/s(?P<season>\d{,2})e(?P<episode>\d{,2})\.',
-                r'/sesong-(?P<season>\d{,2})/episode-(?P<episode>\d{,2})',
-            ]
-            season_number = int_or_none(self._search_regex(
-                EPISODENUM_RE, _season_episode, 'season number',
-                default=None, group='season'))
-            episode_number = int_or_none(self._search_regex(
-                EPISODENUM_RE, _season_episode, 'episode number',
-                default=None, group='episode'))
-
-        thumbnails = None
-        images = data.get('images')
-        if images and isinstance(images, dict):
-            web_images = images.get('webImages')
-            if isinstance(web_images, list):
-                thumbnails = [{
-                    'url': image['imageUrl'],
-                    'width': int_or_none(image.get('width')),
-                    'height': int_or_none(image.get('height')),
-                } for image in web_images if image.get('imageUrl')]
-
-        description = data.get('description')
-        category = data.get('mediaAnalytics', {}).get('category')
-
-        common_info = {
-            'description': description,
-            'series': series,
-            'episode': episode,
-            'season_number': season_number,
-            'episode_number': episode_number,
-            'categories': [category] if category else None,
-            'age_limit': parse_age_limit(data.get('legalAge')),
-            'thumbnails': thumbnails,
-        }
-
-        vcodec = 'none' if data.get('mediaType') == 'Audio' else None
-
-        for entry in entries:
-            entry.update(common_info)
-            for f in entry['formats']:
-                f['vcodec'] = vcodec
-
-        points = data.get('shortIndexPoints')
-        if isinstance(points, list):
-            chapters = []
-            for next_num, point in enumerate(points, start=1):
-                if not isinstance(point, dict):
-                    continue
-                start_time = parse_duration(point.get('startPoint'))
-                if start_time is None:
-                    continue
-                end_time = parse_duration(
-                    data.get('duration')
-                    if next_num == len(points)
-                    else points[next_num].get('startPoint'))
-                if end_time is None:
-                    continue
-                chapters.append({
-                    'start_time': start_time,
-                    'end_time': end_time,
-                    'title': point.get('title'),
-                })
-            if chapters and len(entries) == 1:
-                entries[0]['chapters'] = chapters
-
-        return self.playlist_result(entries, video_id, title, description)
 
 
 class NRKIE(NRKBaseIE):
@@ -257,6 +84,13 @@ class NRKIE(NRKBaseIE):
             video_id, 'Downloading manifest JSON')
 
         playable = manifest['playable']
+        if playable is None:
+            raise ExtractorError(
+                '%s said: %s, see %s' % (self.IE_NAME,
+                    manifest['nonPlayable']['endUserMessage'],
+                    manifest['nonPlayable']['helpUrl']),
+                expected=True)
+
 
         formats = []
         for asset in playable['assets']:
